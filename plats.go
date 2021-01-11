@@ -1,117 +1,102 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"io/ioutil"
-	"net/http"
-	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
+	"github.com/antchfx/htmlquery"
 	"golang.org/x/net/html"
 )
 
-//Want to get all plats recorded since the
-
 type PlatRecording struct {
-	Year, PartyFrom, PartyTo, Date string
+	EntryNumber, Year, PartyFrom, PartyTo, Date string
 }
 
 type DocumentDetail struct {
 	ReceivingParty, Description string
 }
 
+//GetAllPlatsRecordedSince will query the Utah County Recorder's office and will pull all
+//subdivision plats (designation "S PLAT") that have been recorded since the date 'd' passed in
 func GetAllPlatsRecordedSince(d time.Time) (map[string]PlatRecording, error) { 
 	//todo add funcionality to schedule this job and save the last recorded time it ran so it picks up every one
-	params := url.Values{
-		"Submit": {"Search"},
-		"avKoi": {"S+PLAT"},
-		"avEntryDate": {"11-30-2020"},
-	}
-	url := url.URL{
-		Host: "www.utahcounty.gov",
-		Scheme: "http",
-		Path: "LandRecords/DocKoi.asp",
-		RawQuery: params.Encode(),
+
+	offset := 0
+	doc, err := getSPlatHTMLSince(d, offset)
+	if err != nil {
+		return nil, fmt.Errorf("Error getting S PLAT HTML since %v. Error: %v", d, err)
 	}
 
-	resp, err := http.Get(url.String())
+	plats := map[string]PlatRecording{}
+	numFound, err := extractPlatRecordingsFromDocToMap(doc, plats)
 	if err != nil {
-		return nil, fmt.Errorf("Error with the request to get the webpage at URL: %s", url.String())
-	} 
-	if resp.StatusCode >= 300 {
-		msg, err := getFailedResponseError(resp)
+		return nil, fmt.Errorf("Unable to extract plat recordings to map: %s", err.Error())
+	}
+
+	for numFound == 100 {
+		offset += 100
+		doc, err := getSPlatHTMLSince(d, offset)
 		if err != nil {
-			return nil, fmt.Errorf("%s | Unable to get >300 response error message", err.Error())
+			return nil, fmt.Errorf("Error getting S PLAT HTML since %v. Error: %v", d, err)
 		}
-		return nil, errors.New(msg)
+
+		numFound, err = extractPlatRecordingsFromDocToMap(doc, plats)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to extract plat recordings to map: %s", err.Error())
+		}
 	}
 
-	data, err := extractPlatDocumentDataFromHtml(resp)
+	return plats, nil
+}
+
+func extractPlatRecordingsFromDocToMap(doc *html.Node, platsMap map[string]PlatRecording) (numFound int, err error) {
+
+	dataRows, err := htmlquery.QueryAll(doc, "//tr")
 	if err != nil {
-		return nil, fmt.Errorf("Unable to extract plat document data from HTML. Error: %s", err.Error())
+		return 0, fmt.Errorf("Error querying for all S PLAT data rows: %s", err.Error())
 	}
-	
-	return data, nil
+	if len(dataRows) == 0 {
+		return 0, fmt.Errorf("Unable to locate any S PLAT data rows")
+	}
+
+	for _, row := range dataRows {
+		e := getEntryNumber(row)
+		platsMap[e] = getPlatRecording(e, row)
+	}
+
+	return len(dataRows), nil
 }
 
-func getFailedResponseError(resp *http.Response) (string, error) {
-	if resp.StatusCode < 300 {
-		return "", fmt.Errorf("Cannot perform operation on request that didn't fail")
-	}
+func getEntryNumber(row *html.Node) string {
+	a := htmlquery.FindOne(row, "//a")
+	return htmlquery.InnerText(a)
+}
 
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+func getPlatRecording(entryNum string, row *html.Node) PlatRecording {
+	y := htmlquery.FindOne(row, "//td[3]")
+	d := htmlquery.FindOne(row, "//td[4]")
+	f := htmlquery.FindOne(row, "//td[5]")
+	t := htmlquery.FindOne(row, "//td[6]")
+
+	return PlatRecording{
+		EntryNumber: entryNum,
+		Year: htmlquery.InnerText(y),
+		Date: htmlquery.InnerText(d),
+		PartyFrom: htmlquery.InnerText(f),
+		PartyTo: htmlquery.InnerText(t),
+	}
+}
+
+//getSPlatHTMLSince will grab the HTML page from the Utah County Recorder's website
+//Offset is how pagination is handled. An offset of '0' will yield the first page of results. Pages are 100 entries in length at max.
+func getSPlatHTMLSince(d time.Time, offset int) (*html.Node, error) {
+	entryDate := d.Format("1/02/2006")
+	entryDate = strings.Replace(entryDate, "/", "%2F", 3)
+	doc, err := htmlquery.LoadURL(fmt.Sprintf("http://www.utahcounty.gov/LandRecords/DocKoi.asp?avKoi=S+PLAT&avEntryDate=%s&Submit=Search&offset=%d", entryDate, offset))
 	if err != nil {
-		return "", fmt.Errorf("Unable to read response body")
+		return nil, fmt.Errorf("Error performing S PLAT search: %v", err.Error())
 	}
 
-	return fmt.Sprintf("Error with request to URL: '%s'. Status code: '%d'. Body: '%s'", resp.Request.URL.String(), resp.StatusCode, body), nil
-}
-
-func extractPlatDocumentDataFromHtml(resp *http.Response) (map[string]PlatRecording, error) {
-	
-	defer resp.Body.Close()
-	z := html.NewTokenizer(resp.Body)
-
-    content := make(map[string]PlatRecording)
-
-    // While have not hit the </html> tag
-    for z.Token().Data != "html" {
-        tt := z.Next()
-		if tt != html.StartTagToken { continue }
-		
-		t := z.Token()
-		if t.Data != "td" { continue }
-
-		inner := z.Next()
-		if inner != html.TextToken { continue } //only grab tokens inside tds that have text in it
-
-		z.
-		addDataToMap(content, inner, z)
-
-    }
-    // Print to check the slice's content
-    fmt.Println(content)
-
-	return nil, nil
-}
-
-func addDataToMap(bucket *map[string]PlatRecording, inner html.Token, z html.Tokenizer) {
-	
-	text := (string)(z.Text())
-	text = strings.TrimSpace(text)
-
-	if isEntryNumber, _ := regexp.MatchString(`\d{6}`, text); isEntryNumber {
-		//will need to grab the year of the sibling td
-		return
-	}
-	if isDate, _ := regexp.MatchString(`\d{1,2}\/\d{1,2}\/\d{4}`, text); isDate {
-		
-		return
-	}
-
-
+	return doc, nil
 }

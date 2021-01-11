@@ -7,9 +7,12 @@ import (
 
 func main() {
 	d := time.Now()
-	_, err := GetAllPlatsRecordedSince(d)
-
+	plats, err := GetAllPlatsRecordedSince(d)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(fmt.Errorf(err.Error()))
+	}
+
+	for _, plat := range plats {
+		fmt.Println(plat)
 	}
 }
